@@ -15,13 +15,13 @@ const Header: React.FC<HeaderProps> = ({ isOpen }) => {
   return (
     <header className="w-full border-b dark:border-gray-700 py-3 bg-white dark:bg-gray-800 fixed top-0 z-[70] transition-all duration-300 ease-in-out shadow-sm">
       <div className="px-4 sm:px-6 flex items-center justify-between h-16 w-full">
-        <div className="flex items-center space-x-4">
+        <div className="flex items-center space-x-2 sm:space-x-4">
           <img
-            src="/brix_logo.jpeg"
+            src="src/assets/brix_logo.jpeg"
             alt="Brix AI Logo"
-            className="h-8 w-auto rounded-md"
+            className="h-5 w-auto sm:h-8 rounded-md"
           />
-          <h1 className="font-bold text-xl text-gray-900 dark:text-white">
+          <h1 className="font-bold text-xs sm:text-xl text-gray-900 dark:text-white">
             Medical Coding Assistant
           </h1>
         </div>
