@@ -8,8 +8,8 @@ const crypto = window.crypto;
 interface AuthContextType {
   user: User | null;
   loading: boolean;
-  signIn: (email: string, password: string) => Promise<{ error: any }>;
-  signUp: (email: string, password: string) => Promise<{ error: any }>;
+  signIn: (email: string, password: string) => Promise<{ error: any; success?: string }>;
+  signUp: (email: string, password: string) => Promise<{ error: any; success?: string }>;
   signOut: () => Promise<void>;
 }
 
@@ -46,13 +46,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
       if (!emailRegex.test(email)) {
         console.error('Client-side validation failed: Invalid email format');
-        return { error: { message: 'Please enter a valid email address' } };
+        return { error: { message: 'Please enter a valid email address' }, success: null };
       }
 
       // Password validation
       if (password.length < 6) {
         console.error('Client-side validation failed: Password too short');
-        return { error: { message: 'Password must be at least 6 characters long' } };
+        return { error: { message: 'Password must be at least 6 characters long' }, success: null };
       }
 
       // First check if the email already exists in the users table
@@ -64,7 +64,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (existingUser) {
         console.error('User already exists with this email');
-        return { error: { message: 'An account with this email already exists' } };
+        return { error: { message: 'An account with this email already exists' }, success: null };
       }
 
       // Generate a unique ID for the user
@@ -83,11 +83,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (insertError) {
         console.error('Error creating user account:', insertError);
-        return { error: { message: 'Failed to create user account. Please try again.' } };
+        return { error: { message: 'Failed to create user account. Please try again.' }, success: null };
       }
 
       console.log('User account created successfully');
-      return { error: null };
+      return { error: null, success: 'Account created successfully! You can now sign in.' };
 
     } catch (error) {
       // Catch any other unexpected errors during the process
@@ -96,7 +96,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (error instanceof Error) {
         message = error.message; // Provide more specific error if available
       }
-      return { error: { message } };
+      return { error: { message }, success: null };
     }
   };
 
@@ -111,13 +111,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (userError || !userData) {
         console.error('User not found:', userError);
-        return { error: { message: 'Invalid email or password' } };
+        return { error: { message: 'Invalid email or password' }, success: null };
       }
       
       // Verify password
       if (userData.password !== password) {
         console.error('Invalid password');
-        return { error: { message: 'Invalid email or password' } };
+        return { error: { message: 'Invalid email or password' }, success: null };
       }
 
       // Password verified, now setting the user
@@ -141,14 +141,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       localStorage.setItem('user', JSON.stringify(userObject));
       
       console.log('User logged in successfully');
-      return { error: null };
+      return { error: null, success: 'Logged in successfully!' };
     } catch (error) {
       console.error('Unexpected login error:', error);
       let message = 'An unexpected error occurred during login. Please try again.';
       if (error instanceof Error) {
         message = error.message;
       }
-      return { error: { message } };
+      return { error: { message }, success: null };
     }
   };
 
