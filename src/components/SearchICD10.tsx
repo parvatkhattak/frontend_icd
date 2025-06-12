@@ -89,7 +89,7 @@ const SearchICD10: React.FC = () => {
       setError(null);
       
       try {
-        const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(searchQuery)}`;
+        const endpoint = `https://icd-search.onrender.com/api/v1/search/${encodeURIComponent(searchQuery)}`;
         console.log('Searching with endpoint:', endpoint);
         
         // ACTUAL API CALL - This was missing!
@@ -174,7 +174,7 @@ const SearchICD10: React.FC = () => {
       setError(null);
       
       try {
-        const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(code)}`;
+        const endpoint = `https://icd-search.onrender.com/api/v1/search/${encodeURIComponent(code)}`;
         const response = await fetch(endpoint, {
           method: 'GET',
           headers: {
@@ -234,7 +234,7 @@ const SearchICD10: React.FC = () => {
     
     try {
       // Actual API call for code details
-      const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(code)}`;
+      const endpoint = `https://icd-search.onrender.com/api/v1/search/${encodeURIComponent(code)}`;
       const response = await fetch(endpoint, {
         method: 'GET',
         headers: {
