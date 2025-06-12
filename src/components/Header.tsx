@@ -17,7 +17,7 @@ const Header: React.FC<HeaderProps> = ({ isOpen }) => {
       <div className="px-4 sm:px-6 flex items-center justify-between h-16 w-full">
         <div className="flex items-center space-x-2 sm:space-x-4">
           <img
-            src="src/assets/brix_logo.jpeg"
+            src="/brix_logo.jpeg"
             alt="Brix AI Logo"
             className="h-5 w-auto sm:h-8 rounded-md"
           />
