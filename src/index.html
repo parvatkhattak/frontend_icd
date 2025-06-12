@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brix AI - ICD-10 Code Finder</title>
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
+    <!-- Stylesheets -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        /* Custom styles for the application */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.3s ease forwards;
+        }
+    </style>
+</head>
+<body>
+    <!-- Logo removed from top left -->
+
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">
+                <span class="logo-text">BRIX AI</span>
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/">ICD-10 Code Finder</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container py-5">
+        <div class="row justify-content-center">
+            <div class="col-lg-10">
+                <div class="card mb-4 fade-in">
+                    <div class="card-header d-flex align-items-center">
+                        <i class="bi bi-search me-2"></i>
+                        <h5 class="mb-0">Search for ICD-10 Codes</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <div class="position-relative">
+                                <input type="text" class="form-control form-control-lg" id="search-input"
+                                    placeholder="Type a diagnosis term (e.g., diabetes, hypertension, pain)">
+                                <div class="position-absolute top-50 end-0 translate-middle-y pe-3">
+                                    <div class="loading-spinner d-none" id="search-spinner"></div>
+                                </div>
+                            </div>
+                            <div id="search-results" class="list-group mt-1 d-none"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4 d-none fade-in" id="term-details-card">
+                    <div class="card-header d-flex align-items-center">
+                        <i class="bi bi-diagram-3 me-2"></i>
+                        <h5 id="term-title" class="mb-0">Term Details</h5>
+                    </div>
+                    <div class="card-body">
+                        <nav aria-label="breadcrumb" class="mb-3">
+                            <ol class="breadcrumb" id="navigation-breadcrumb">
+                                <li class="breadcrumb-item active">Hierarchical Navigation</li>
+                            </ol>
+                        </nav>
+
+                        <div class="row g-4">
+                            <div class="col-lg-5">
+                                <div class="card h-100 border-0 shadow-sm">
+                                    <div class="card-header d-flex align-items-center">
+                                        <i class="bi bi-info-circle me-2"></i>
+                                        <h6 class="mb-0">Term Information</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="term-info" class="fade-in">
+                                            <!-- Term information will be displayed here -->
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-7">
+                                <div class="card h-100 border-0 shadow-sm">
+                                    <div class="card-header d-flex align-items-center">
+                                        <i class="bi bi-list-nested me-2"></i>
+                                        <h6 class="mb-0">Subterms</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="term-children" class="list-group fade-in">
+                                            <!-- Child terms will be displayed here -->
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mt-4">
+                            <button id="back-button" class="btn btn-outline-primary d-none">
+                                <i class="bi bi-arrow-left"></i> Back to Previous Level
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4 d-none fade-in" id="code-details-card">
+                    <div class="card-header d-flex align-items-center">
+                        <i class="bi bi-upc-scan me-2"></i>
+                        <h5 class="mb-0">ICD-10 Code Details</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="code-info" class="fade-in">
+                            <!-- Code information will be displayed here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="py-4 bg-light mt-5">
+        <div class="container text-center">
+            <p class="mb-0 text-muted">Powered by <strong>Brix AI</strong> | ICD-10 Code Finder</p>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>

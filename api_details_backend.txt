@@ -1,0 +1,1210 @@
+import os
+import logging
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, Request
+import nltk
+from pydantic import BaseModel
+from qdrant_client import QdrantClient
+# Remove Groq import
+# from groq import Groq 
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from fastapi.middleware.cors import CORSMiddleware
+import json
+from fastapi.responses import JSONResponse
+
+# Import Google Gemini libraries
+import base64
+import os
+from google import genai
+from google.genai import types
+import json
+
+
+# Define custom download directory
+custom_dir = "nltk_data"
+
+# Download stopwords to the specified folder
+nltk.download('stopwords', download_dir=custom_dir)
+nltk.download('punkt', download_dir=custom_dir)
+
+
+from nltk.corpus import stopwords
+nltk.data.path.append(custom_dir)
+
+def remove_stopwords(text):
+    stop_words = set(stopwords.words('english'))
+    words = [word.strip() for word in text.lower().split() if word.strip() != ""]
+    return [word for word in words if word.isalnum() and word not in stop_words]
+
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Constants
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+# Remove Groq API Key
+# QROQ_API_KEY = os.getenv("QROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Add Gemini API Key
+COLLECTION_NAME = "Medical_Coder"
+
+# Initialize clients
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+gemini_client =  genai.Client(
+        api_key=os.environ.get("GEMINI_API_KEY"),
+    ) # Using a standard model, adjust if needed
+gemini_model =  "gemini-2.0-flash"
+# Initialize the sentence transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Initialize FastAPI app
+app = FastAPI(title="Medical Coding Chatbot")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+class ChatRequest(BaseModel):
+    question: str
+    chat_id: str
+    user_id: str = "default_user"
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]] = []
+
+
+# Load the ICD-10 index data
+def load_icd10_data():
+    with open('icd10-index.json', 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+# Global variable to store the data
+icd10_data = load_icd10_data()
+
+# Helper function to find a term in children
+def find_term_in_children(children, path, parent_path=""):
+    """Recursively search for a term in children based on path"""
+    for child in children:
+        child_path = child.get('path', '')
+        
+        # Handle both string and object paths
+        if isinstance(child_path, dict):
+            path_text = child_path.get('_', '')
+            path_nemod = child_path.get('nemod', '')
+            full_path = f"{path_text} {path_nemod}".strip()
+        else:
+            full_path = child_path
+            
+        if full_path == path:
+            return child
+            
+        # If this child has children, search them too
+        if 'children' in child:
+            result = find_term_in_children(child['children'], path, full_path)
+            if result:
+                return result
+                
+        # Also check terms array if it exists
+        if 'terms' in child:
+            result = find_term_in_children(child['terms'], path, full_path)
+            if result:
+                return result
+                
+    return None
+
+def search_qdrant(query: str, limit: int = 5):
+    """Search Qdrant for relevant documents based on the query (kept for compatibility)"""
+    try:
+        # Generate embedding for the query
+        keywords = remove_stopwords(query)
+        keywords = " ".join(keywords)
+        print(keywords)
+        query_embedding = model.encode(keywords, convert_to_tensor=False).tolist()
+        
+        # Search Qdrant
+        search_result = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_embedding,
+            limit=limit
+        )
+        
+        # Extract text and metadata from search results
+        results = []
+        for result in search_result:
+            results.append({
+                "text": result.payload.get("text", ""),
+                "metadata": result.payload.get("metadata", {}),
+                "score": result.score
+            })
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error searching Qdrant: {e}")
+        return []
+
+def is_medical_query(question: str) -> bool:
+    """Determine if the question is related to medical coding"""
+    medical_keywords = [
+        'icd', 'code', 'diagnosis', 'medical', 'condition', 'disease', 'symptom',
+        'guideline', 'documentation', 'requirement', 'coding', 'clinical', 'health',
+        'patient', 'treatment', 'procedure', 'assessment', 'record', 'chart'
+    ]
+    
+    question_lower = question.lower()
+    # Check for common greetings or general chat
+    general_chat_patterns = ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening', 'how are you']
+    
+    if any(pattern in question_lower for pattern in general_chat_patterns):
+        return False
+    
+    # Check if the question contains medical coding related keywords
+    return any(keyword in question_lower for keyword in medical_keywords)
+
+def generate_answer(question: str, context_docs: List[Dict[str, Any]] = None, conversation_history: List[Dict[str, str]] = None, redefined_query: str=None):
+    """Generate an answer using Google Gemini LLM with context from Qdrant and conversation history"""
+    try:
+        # Determine if it's a medical query
+        is_medical = is_medical_query(question)
+        user_prompt = ""
+        system_instruction = """
+        You are a certified ICD-10-CM coding assistant. Using the three inputs below, give a concise, accurate answer:        
+        TASK: 
+        • List the Primary Diagnosis Code(s) and description(s). 
+        • List any Secondary Code(s) if applicable. 
+        • For each code, give a 1-2-sentence rationale referencing the context. 
+        • If you need more detail (e.g. laterality, acuity), ask one brief clarification question. 
+        • End with a one-sentence disclaimer.
+        Use these inputs to give an accurate, clear response with: 
+        - All relevant codes listed first (with descriptions) 
+        - Then the rationale for each code 
+        - A clarification if any detail is missing 
+        - A final disclaimer 
+        OUTPUT FORMAT: 
+        **ICD-10-CM Codes:** 
+        - CODE - Description 
+        - CODE - Description (Include both primary and secondary codes in one list.) 
+        **Rationale:** 
+        - CODE: Explanation (refer to guidelines, includes/excludes, or context match) 
+        - CODE: Explanation **Clarification (if needed):** 
+        - Question about missing details (e.g. severity, location, type) 
+        **Disclaimer:** This answer is for informational purposes only. Please confirm with the latest ICD-10-CM guidelines or a certified medical coder.
+        """ 
+        
+        # Prepare system instruction based on query type
+        if is_medical:
+            context = "\n\n".join([doc["text"] for doc in (context_docs or [])])
+            system_instruction = f"""
+                You are a certified ICD-10-CM coding assistant. Using the three inputs below, give a concise, accurate answer: 
+                TASK: 
+                • List the Primary Diagnosis Code(s) and description(s). 
+                • List any Secondary Code(s) if applicable. 
+                • For each code, give a 1–2-sentence rationale referencing the context. 
+                • If you need more detail (e.g. laterality, acuity), ask one brief clarification question. 
+                • End with a one-sentence disclaimer.
+                Use these inputs to give an accurate, clear response with: 
+                - All relevant codes listed first (with descriptions) 
+                – Then the rationale for each code 
+                - A clarification if any detail is missing 
+                - A final disclaimer 
+                OUTPUT FORMAT: 
+                **ICD-10-CM Codes:** 
+                - CODE – Description 
+                - CODE – Description (Include both primary and secondary codes in one list.) 
+                **Rationale:** 
+                - CODE: Explanation (refer to guidelines, includes/excludes, or context match) 
+                - CODE: Explanation **Clarification (if needed):** 
+                - Question about missing details (e.g. severity, location, type) 
+                **Disclaimer:** This answer is for informational purposes only. Please confirm with the latest ICD-10-CM guidelines or a certified medical coder.
+            """
+            # Prepare context from retrieved documents
+            user_prompt = f"""1. User Question: 
+                    {question} # Use the original question here
+                2. Refined Search Query: 
+                {redefined_query}
+                3. Retrieved Context: 
+                {context}"""
+            
+        else:
+            system_instruction = (
+                "You are a friendly and professional medical coding assistant. "
+                "For general queries and greetings, provide helpful and welcoming responses. "
+                "If the conversation turns to medical coding topics, inform the user that you can help with ICD-10-CM coding questions."
+            )
+            user_prompt = question
+        
+        # Prepare contents list for Gemini
+        # Gemini expects a list of Content objects, alternating user/model roles
+        # We'll build the history first, then add the system instruction and current user prompt
+        contents = []
+        if conversation_history:
+            for message in conversation_history:
+                role = 'user' if message['role'] == 'user' else 'model'
+                # Pass content as dictionary
+                contents.append(types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=message["content"]), ], )
+                )
+
+        # Add the current user prompt as dictionary
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_prompt), ], )
+        )
+
+        # Configure generation using genai.GenerationConfig
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0.7 if not is_medical else 0.5,
+            max_output_tokens=1024,
+            top_p=1,
+            system_instruction=[
+            types.Part.from_text(text=system_instruction), ],
+            response_mime_type="text/plain" # Ensure text response
+        )
+
+
+        # Generate content using Gemini (non-streaming)
+        response = ""
+        for chunk in gemini_client.models.generate_content_stream(
+            model=gemini_model,
+            contents=contents,
+            config=generate_content_config,
+        ):
+            response += chunk.text
+        
+        # Extract the answer
+        if response:
+            answer = response
+        else:
+            logger.warning(f"Gemini response might be blocked or empty: {response}")
+            answer = "I couldn't generate a response. This might be due to safety filters or an issue with the request."
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                 answer += f" Reason: {response.prompt_feedback.block_reason.name}"
+
+        return answer
+    except Exception as e:
+        logger.error(f"Error generating answer with Gemini: {e}")
+        return "I'm sorry, I encountered an error while generating your answer. Please try again."
+
+# Function to get conversation history from Supabase
+async def get_conversation_history(chat_id: str, user_id: str, limit: int = 3):
+    """Retrieve the last few messages from Supabase for a specific chat"""
+    try:
+        from supabase import create_client, Client
+        
+        # Get Supabase credentials from environment variables
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        supabase_table = os.getenv("SUPABASE_TABLE_NAME")
+        
+        # Create Supabase client
+        supabase: Client = create_client(supabase_url, supabase_key)
+        
+        # Query the last few messages for this chat
+        response = supabase.table(supabase_table)\
+            .select("*")\
+            .eq("chat_id", chat_id)\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+        print(response)
+        # Check if chat exists
+        if not response.data:
+            return []
+        
+        # Format the conversation history
+        history = []
+        for msg in reversed(response.data):  # Reverse to get chronological order
+            history.append({"role": "user", "content": msg["user_message"]})
+            history.append({"role": "model", "content": msg["ai_message"]})
+        print(history)
+        return history
+    except Exception as e:
+        logger.error(f"Error retrieving conversation history: {e}")
+        return []
+
+def redefine_query(question: str):
+    """Redefine the question using Google Gemini LLM"""
+    try:
+        system_instruction = (
+                """
+            You are an expert medical coding librarian and ICD-10-CM specialist. Your job is to take any user question about ICD-10 coding and turn it into a precise, retrieval-ready query plus structured filters. Always adhere to official ICD-10–CM guideline language, include relevant synonyms and qualifiers, and flag any ambiguities.
+
+            TASKS (in order):
+            1. Classify the user's intent into one of:
+            • Code Lookup (find specific diagnosis code)
+            • Guideline Lookup (rules—e.g., sequencing, code first)
+            • Inclusion/Exclusion Query (what's excluded/included)
+            • Comparison (differences between two codes)
+            • Clinical Scenario (PDx vs SDx, E/M level)
+            • Other (if none of the above)
+
+            2. Extract any explicit or implicit metadata:
+            • Body system / chapter  
+            • Section / category  
+            • Patient context (age, gender, setting)  
+            • Code-level qualifiers (acute vs chronic, laterality, severity)
+
+            3. Enrich the query:
+            • Add synonyms (e.g., "MI" → "myocardial infarction")  
+            • Add relevant guideline calls ("use additional code for…")  
+            • Insert inclusion/exclusion terms ("excludes:…", "includes:…")  
+
+            4. If the user's question is ambiguous or missing key info (e.g., "What code for infection?"), generate a follow-up clarification question instead of a reformulation.
+
+            5. Produce output:
+            **JSON Filters Object** with keys:
+            ```json
+            {
+                "query" : " ("Rewritten Search Query: …") "
+                "intent":        "<one of the intent classes>",
+                "search_query":  "<expanded natural-language query>",
+                "filters": {
+                "chapter":     "<chapter name or null>",
+                "section":     "<section name or null>",
+                "code":        "<explicit code if mentioned>",
+                "keywords":    ["<term1>", "<term2>", ...],
+                "patient": {
+                    "age":      "<e.g. adult, pediatric, null>",
+                    "gender":   "<male/female/null>"
+                },
+                "include":     ["<include term1>", ...],
+                "exclude":     ["<exclude term1>", ...]
+                }
+            }
+
+            """
+            )
+        user_prompt = question
+        
+        # Prepare contents for Gemini as dictionary
+        contents = []
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_prompt), ], )
+        )
+
+
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0.5,
+            max_output_tokens=1024,
+            top_p=1,
+            system_instruction=[
+            types.Part.from_text(text=system_instruction), ],
+            response_mime_type="text/plain" # Ensure text response
+        )
+
+
+        # Generate content using Gemini (non-streaming)
+        response = ""
+        for chunk in gemini_client.models.generate_content_stream(
+            model=gemini_model,
+            contents=contents,
+            config=generate_content_config,
+        ):
+            response += chunk.text
+        
+        # Extract the answer
+        if response:
+            answer = response
+        else:
+            logger.warning(f"Gemini response might be blocked or empty for redefine_query: {response}")
+            answer = "I'm sorry, I encountered an error while restructuring the question. Please try again."
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                 answer += f" Reason: {response.prompt_feedback.block_reason.name}"
+
+        return answer
+    except Exception as e:
+        logger.error(f"Error restructuring the question with Gemini: {e}")
+        return "I'm sorry, I encountered an error while generating your answer(Question). Please try again."
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """API endpoint for chat"""
+    # Get conversation history if chat_id is provided
+    conversation_history = []
+    if request.chat_id:
+        conversation_history = await get_conversation_history(request.chat_id, request.user_id)
+    
+    if not is_medical_query(request.question):
+        # Handle general chat without querying Qdrant
+        answer = generate_answer(request.question, context_docs=None, conversation_history=conversation_history)
+        return ChatResponse(answer=answer, sources=[])
+    user_question = request.question
+
+    redefined_query = redefine_query(user_question)
+    # For medical queries, search relevant documents
+    search_results = search_qdrant(user_question)
+    
+    # Generate answer with context and conversation history
+    answer = generate_answer(user_question, search_results, conversation_history, redefined_query)
+    
+    # Prepare sources information
+    sources = []
+    for result in search_results:
+        metadata = result["metadata"]
+        sources.append({
+            "file_name": metadata.get("file_name", "Unknown"),
+            "source": metadata.get("source", "Unknown"),
+            "score": result["score"]
+        })
+    
+    return ChatResponse(answer=answer, sources=sources)
+
+def search_icd10(query: str, limit: int = 20):
+    """Search for ICD-10 codes based on the query using the JSON index"""
+    try:
+        query = query.lower()
+        if not query:
+            return []
+            
+        # Search for terms that match the query at any level
+        results = []
+
+        for letter in icd10_data['letters']:
+            for term in letter['terms']:
+                # Process the term title
+                term_title = term.get('title', '')
+                display_title = ''
+                
+                # Handle both string and object titles
+                if isinstance(term_title, dict):
+                    term_text = term_title.get('_', '')
+                    nemod = term_title.get('nemod', '')
+                    display_title = f"{term_text} {nemod}".strip()
+                else:
+                    display_title = term_title
+                
+                # Check if the term has a path, if not use title as path
+                term_path = term.get('path', term_title)
+                path_string = ''
+                
+                # Convert path object to string if needed
+                if isinstance(term_path, dict):
+                    path_text = term_path.get('_', '')
+                    path_nemod = term_path.get('nemod', '')
+                    path_string = f"{path_text} {path_nemod}".strip()
+                else:
+                    path_string = str(term_path)
+                
+                # Check if query matches the title
+                if query in display_title.lower():
+                    code = term.get('code', '')
+                    see = term.get('see', '')
+                    see_also = term.get('seeAlso', '')
+                    
+                    results.append({
+                        'title': display_title,
+                        'path': path_string,
+                        'letter': letter['title'],
+                        'code': code,
+                        'see': see,
+                        'seeAlso': see_also,
+                        'has_children': 'terms' in term or 'children' in term,
+                        'original_term': term
+                    })
+                    
+                    # Limit results to prevent overwhelming the UI
+                    if len(results) >= limit:
+                        break
+                
+                # Also search in child terms if they exist
+                if 'terms' in term and len(results) < limit:
+                    child_results = search_in_child_terms(term['terms'], query, letter['title'], path_string, limit - len(results))
+                    results.extend(child_results)
+                
+                # Also search in children if they exist (alternative structure)
+                if 'children' in term and len(results) < limit:
+                    child_results = search_in_child_terms(term['children'], query, letter['title'], path_string, limit - len(results))
+                    results.extend(child_results)
+                
+                if len(results) >= limit:
+                    break
+            
+            if len(results) >= limit:
+                break
+
+        return results
+    except Exception as e:
+        logger.error(f"Error in search_icd10: {e}")
+        return []
+
+def search_in_child_terms(terms, query, letter, parent_path, limit):
+    """Helper function to search in child terms"""
+    results = []
+    
+    for term in terms:
+        if len(results) >= limit:
+            break
+            
+        # Process the term title
+        term_title = term.get('title', '')
+        display_title = ''
+        
+        # Handle both string and object titles
+        if isinstance(term_title, dict):
+            term_text = term_title.get('_', '')
+            nemod = term_title.get('nemod', '')
+            display_title = f"{term_text} {nemod}".strip()
+        else:
+            display_title = term_title
+        
+        # Check if the term has a path, if not construct from parent path
+        term_path = term.get('path', '')
+        path_string = ''
+        
+        # Convert path object to string if needed
+        if isinstance(term_path, dict):
+            path_text = term_path.get('_', '')
+            path_nemod = term_path.get('nemod', '')
+            path_string = f"{path_text} {path_nemod}".strip()
+        elif term_path:
+            path_string = str(term_path)
+        else:
+            # If no path, construct from parent and title
+            path_string = f"{parent_path} > {display_title}"
+        
+        # Check if query matches the title
+        if query in display_title.lower():
+            code = term.get('code', '')
+            see = term.get('see', '')
+            see_also = term.get('seeAlso', '')
+            
+            results.append({
+                'title': display_title,
+                'path': path_string,
+                'letter': letter,
+                'code': code,
+                'see': see,
+                'seeAlso': see_also,
+                'has_children': 'terms' in term or 'children' in term,
+                'original_term': term,
+                'parent_path': parent_path
+            })
+        
+        # Recursively search in child terms if they exist
+        if 'terms' in term and len(results) < limit:
+            child_results = search_in_child_terms(term['terms'], query, letter, path_string, limit - len(results))
+            results.extend(child_results)
+        
+        # Recursively search in children if they exist (alternative structure)
+        if 'children' in term and len(results) < limit:
+            child_results = search_in_child_terms(term['children'], query, letter, path_string, limit - len(results))
+            results.extend(child_results)
+    
+    return results
+
+def get_term_details(letter: str, path: str, parent_path: str = ''):
+    """Get detailed information for a specific ICD-10 term"""
+    try:
+        if not letter or not path:
+            return {"error": "Missing parameters"}
+            
+        # Special case for Diabetes term
+        if letter == "D" and ("Diabetes" in path or path == "{'_': 'Diabetes, diabetic', 'nemod': '(mellitus) (sugar)'}"):
+            # Find the Diabetes term directly
+            for letter_obj in icd10_data['letters']:
+                if letter_obj['title'] == "D":
+                    for term in letter_obj['terms']:
+                        title = term['title']
+                        if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                            return {
+                                'term': term,
+                                'has_children': 'children' in term and len(term['children']) > 0
+                            }
+
+        # Special case for "with" term under Diabetes
+        if path == "[object Object] > with" and letter == "D":
+            # Check if the previous term was Diabetes
+            if parent_path and ("Diabetes" in parent_path or parent_path == "{'_': 'Diabetes, diabetic', 'nemod': '(mellitus) (sugar)'}"):
+                # Find the Diabetes term first
+                diabetes_term = None
+                for letter_obj in icd10_data['letters']:
+                    if letter_obj['title'] == "D":
+                        for term in letter_obj['terms']:
+                            title = term['title']
+                            if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                                diabetes_term = term
+                                break
+
+                if diabetes_term and 'children' in diabetes_term:
+                    # Find the "with" child
+                    for child in diabetes_term['children']:
+                        if child['title'] == 'with':
+                            return {
+                                'term': child,
+                                'has_children': 'children' in child and len(child['children']) > 0
+                            }
+            else:
+                # If no parent_path or not from Diabetes, find the Diabetes term first
+                diabetes_term = None
+                for letter_obj in icd10_data['letters']:
+                    if letter_obj['title'] == "D":
+                        for term in letter_obj['terms']:
+                            title = term['title']
+                            if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                                diabetes_term = term
+                                break
+
+                if diabetes_term and 'children' in diabetes_term:
+                    # Find the "with" child
+                    for child in diabetes_term['children']:
+                        if child['title'] == 'with':
+                            return {
+                                'term': child,
+                                'has_children': 'children' in child and len(child['children']) > 0
+                            }
+
+        # Regular path handling
+        for letter_obj in icd10_data['letters']:
+            if letter_obj['title'] == letter:
+                for term in letter_obj['terms']:
+                    term_path = term['path']
+
+                    # Handle both string and object paths
+                    if isinstance(term_path, dict):
+                        term_path_text = term_path.get('_', '')
+                        term_path_nemod = term_path.get('nemod', '')
+                        full_path = f"{term_path_text} {term_path_nemod}".strip()
+                    else:
+                        full_path = term_path
+
+                    if full_path == path:
+                        # Return the term and its children if any
+                        return {
+                            'term': term,
+                            'has_children': 'children' in term and len(term['children']) > 0
+                        }
+
+                    # If the term has children, check them recursively
+                    if 'children' in term:
+                        child_term = find_term_in_children(term['children'], path, parent_path)
+                        if child_term:
+                            return {
+                                'term': child_term,
+                                'has_children': 'children' in child_term and len(child_term['children']) > 0
+                            }
+
+        return {"error": "Term not found"}
+    except Exception as e:
+        logger.error(f"Error in get_term_details: {e}")
+        return {"error": str(e)}
+
+@app.get('/api/search')
+def search(request: Request):
+    query = request.query_params.get('query', '').lower()
+
+    if not query:
+        return json.dumps([])
+
+    # Search for level 0 terms that match the query
+    results = []
+
+    for letter in icd10_data['letters']:
+        for term in letter['terms']:
+            if term.get('level', 0) == 0:  # Safely access level with default 0
+                term_title = term.get('title', '')
+                # Safely access path, fallback to title if path doesn't exist
+                term_path = term.get('path', term_title)
+
+                # Handle both string and object titles
+                if isinstance(term_title, dict):
+                    term_text = term_title.get('_', '')
+                    nemod = term_title.get('nemod', '')
+                    display_title = f"{term_text} {nemod}".strip()
+                else:
+                    display_title = term_title
+
+                # Convert path object to string if needed
+                if isinstance(term_path, dict):
+                    path_text = term_path.get('_', '')
+                    path_nemod = term_path.get('nemod', '')
+                    path_string = f"{path_text} {path_nemod}".strip()
+                else:
+                    path_string = str(term_path) if term_path else display_title  # Ensure we have a string
+
+                if query in display_title.lower():
+                    results.append({
+                        'title': display_title,
+                        'path': path_string,
+                        'letter': letter['title'],
+                        'original_term': term
+                    })
+
+                    # Limit results to prevent overwhelming the UI
+                    if len(results) >= 20:
+                        break
+
+        if len(results) >= 20:
+            break
+
+    return json.dumps(results)
+
+@app.get('/api/term')
+def get_term(request: Request):
+    letter = request.query_params.get('letter')
+    path = request.query_params.get('path')
+    parent_path = request.query_params.get('parent_path', '')
+
+    if not letter or not path:
+        return JSONResponse(content={'error': 'Missing parameters'}, status_code=400)
+
+    result = get_term_details(letter, path, parent_path)
+    return JSONResponse(content=result)
+
+def get_term(letter: str, path: str, parent_path: str = ''):
+    """Get a specific term by letter and path"""
+    try:
+        if not letter or not path:
+            return {"error": "Missing parameters"}
+            
+        # Find the letter object
+        letter_obj = None
+        for l in icd10_data['letters']:
+            if l['title'] == letter:
+                letter_obj = l
+                break
+                
+        if not letter_obj:
+            return {"error": "Letter not found"}
+            
+        # Find the term in the letter's terms
+        for term in letter_obj['terms']:
+            # Get the term path, fallback to title if path doesn't exist
+            term_title = term.get('title', '')
+            term_path = term.get('path', term_title)
+            
+            # Convert path to string for comparison
+            if isinstance(term_path, dict):
+                path_text = term_path.get('_', '')
+                path_nemod = term_path.get('nemod', '')
+                full_path = f"{path_text} {path_nemod}".strip()
+            else:
+                full_path = str(term_path) if term_path else ''
+                
+            # Check if this is the term we're looking for
+            if full_path == path:
+                return {
+                    'term': term,
+                    'has_children': ('children' in term and len(term['children']) > 0) or 
+                                   ('terms' in term and len(term['terms']) > 0)
+                }
+                
+            # If not found at top level, search in children
+            if 'children' in term:
+                child_term = find_term_in_children(term['children'], path, parent_path)
+                if child_term:
+                    return {
+                        'term': child_term,
+                        'has_children': ('children' in child_term and len(child_term['children']) > 0) or 
+                                       ('terms' in child_term and len(child_term['terms']) > 0)
+                    }
+                    
+            # Also check in terms (alternative structure)
+            if 'terms' in term:
+                child_term = find_term_in_children(term['terms'], path, parent_path)
+                if child_term:
+                    return {
+                        'term': child_term,
+                        'has_children': ('children' in child_term and len(child_term['children']) > 0) or 
+                                       ('terms' in child_term and len(child_term['terms']) > 0)
+                    }
+        
+        return {"error": "Term not found"}
+    except Exception as e:
+        logger.error(f"Error in get_term: {e}")
+        return {"error": str(e)}
+
+def find_term_in_children(children, path, parent_path=''):
+    """Recursively search for a term in the children array based on path."""
+    for child in children:
+        # Get the child path, handle missing path
+        child_path = child.get('path', '')
+        if not child_path and 'title' in child:
+            # If no path but has title, use title
+            child_path = child['title']
+            
+        # Handle both string and object paths
+        if isinstance(child_path, dict):
+            path_text = child_path.get('_', '')
+            path_nemod = child_path.get('nemod', '')
+            full_path = f"{path_text} {path_nemod}".strip()
+        else:
+            full_path = str(child_path)
+
+        # Check for exact match
+        if full_path == path:
+            return child
+
+        # Check for match with [object Object] in path
+        # This handles cases where the path contains "[object Object] > with"
+        if "[object Object]" in path and ">" in path:
+            # Extract the last part of the path (after the last ">")
+            path_parts = path.split(">")
+            last_part = path_parts[-1].strip()
+
+            # Check if the child's title matches the last part of the path
+            child_title = child.get('title', '')
+            if isinstance(child_title, str) and child_title == last_part:
+                # If parent_path is provided, make sure this is the right term
+                if parent_path and parent_path != full_path.split(" > ")[0]:
+                    continue
+                return child
+            elif isinstance(child_title, dict) and child_title.get('_', '') == last_part:
+                # If parent_path is provided, make sure this is the right term
+                if parent_path and parent_path != full_path.split(" > ")[0]:
+                    continue
+                return child
+
+        # Recursively search in this child's children if any
+        if 'children' in child:
+            result = find_term_in_children(child['children'], path, parent_path)
+            if result:
+                return result
+                
+        # Also check in terms (alternative structure)
+        if 'terms' in child:
+            result = find_term_in_children(child['terms'], path, parent_path)
+            if result:
+                return result
+
+    return None
+
+@app.get('/api/children')
+def get_children(request: Request):
+    letter = request.query_params.get('letter')
+    path = request.query_params.get('path')
+    parent_path = request.query_params.get('parent_path', '')
+
+    if not letter or not path:
+        return JSONResponse(content={'error': 'Missing parameters'}, status_code=400)
+        
+    result = find_children_for_path(letter, path, parent_path)
+    return JSONResponse(content=result)
+    
+def find_children_for_path(letter: str, path: str, parent_path: str = ''):
+    """Find children for a specific path"""
+    try:
+        # Get the term details first
+        term_details = get_term_details(letter, path, parent_path)
+        
+        if 'error' in term_details:
+            return {'error': term_details['error']}
+            
+        term = term_details.get('term', {})
+        
+        # Check if the term has children
+        children = []
+        
+        # Check both 'children' and 'terms' fields
+        if 'children' in term:
+            children = term['children']
+        elif 'terms' in term:
+            children = term['terms']
+        
+        # Format the children for response
+        formatted_children = []
+        for child in children:
+            child_title = child.get('title', '')
+            display_title = ''
+            
+            # Handle both string and object titles
+            if isinstance(child_title, dict):
+                title_text = child_title.get('_', '')
+                nemod = child_title.get('nemod', '')
+                display_title = f"{title_text} {nemod}".strip()
+            else:
+                display_title = child_title
+                
+            # Get child path
+            child_path = child.get('path', '')
+            path_string = ''
+            
+            # Handle both string and object paths
+            if isinstance(child_path, dict):
+                path_text = child_path.get('_', '')
+                path_nemod = child_path.get('nemod', '')
+                path_string = f"{path_text} {path_nemod}".strip()
+            elif child_path:
+                path_string = str(child_path)
+            else:
+                # If no path, construct from parent and title
+                path_string = f"{path} > {display_title}"
+                
+            # Add to formatted children
+            formatted_children.append({
+                'title': display_title,
+                'path': path_string,
+                'code': child.get('code', ''),
+                'see': child.get('see', ''),
+                'seeAlso': child.get('seeAlso', ''),
+                'has_children': ('children' in child and len(child['children']) > 0) or 
+                               ('terms' in child and len(child['terms']) > 0)
+            })
+            
+        return {'children': formatted_children}
+    except Exception as e:
+        logger.error(f"Error in find_children_for_path: {e}")
+        return {'error': str(e)}
+
+
+    # Special case for Diabetes term
+    if letter == "D" and ("Diabetes" in path or path == "{'_': 'Diabetes, diabetic', 'nemod': '(mellitus) (sugar)'}"):
+        # Find the Diabetes term directly
+        for term in icd10_data['letters'][3]['terms']:  # D is the 4th letter (index 3)
+            title = term['title']
+            if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                if 'children' in term:
+                    return jsonify(term['children'])
+                else:
+                    return jsonify([])
+
+    # Special case for "with" term under Diabetes
+    if path == "[object Object] > with" and letter == "D":
+        # Check if the previous term was Diabetes
+        if parent_path and ("Diabetes" in parent_path or parent_path == "{'_': 'Diabetes, diabetic', 'nemod': '(mellitus) (sugar)'}"):
+            # Find the Diabetes term first
+            diabetes_term = None
+            for term in icd10_data['letters'][3]['terms']:  # D is the 4th letter (index 3)
+                title = term['title']
+                if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                    diabetes_term = term
+                    break
+
+            if diabetes_term and 'children' in diabetes_term:
+                # Find the "with" child
+                for child in diabetes_term['children']:
+                    if child['title'] == 'with' and 'children' in child:
+                        return jsonify(child['children'])
+        else:
+            # If no parent_path or not from Diabetes, find the Diabetes term first
+            diabetes_term = None
+            for term in icd10_data['letters'][3]['terms']:  # D is the 4th letter (index 3)
+                title = term['title']
+                if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                    diabetes_term = term
+                    break
+
+            if diabetes_term and 'children' in diabetes_term:
+                # Find the "with" child
+                for child in diabetes_term['children']:
+                    if child['title'] == 'with' and 'children' in child:
+                        return jsonify(child['children'])
+
+    # Regular path handling
+    for letter_obj in icd10_data['letters']:
+        if letter_obj['title'] == letter:
+            for term in letter_obj['terms']:
+                # Safely access term_path, fallback to title if path doesn't exist
+                term_title = term.get('title', '')
+                term_path = term.get('path', term_title)
+
+                # Handle both string and object paths
+                if isinstance(term_path, dict):
+                    term_path_text = term_path.get('_', '')
+                    term_path_nemod = term_path.get('nemod', '')
+                    full_path = f"{term_path_text} {term_path_nemod}".strip()
+                else:
+                    full_path = str(term_path) if term_path else ''
+
+                if full_path == path and 'children' in term:
+                    # Return the children with their original level values
+                    return jsonify(term['children'])
+
+                # If the term has children, check them recursively
+                if 'children' in term:
+                    children = find_children_for_path(term['children'], path, parent_path)
+                    if children:
+                        # Return the children with their original level values
+                        return jsonify(children)
+
+    return jsonify([])
+
+def find_children_for_path(children, path, parent_path=''):
+    """Recursively search for children of a term with the given path."""
+    # Special case for "with" term under Diabetes
+    if path == "[object Object] > with":
+        # Check if parent_path indicates we're coming from Diabetes
+        if parent_path and ("Diabetes" in parent_path or parent_path == "{'_': 'Diabetes, diabetic', 'nemod': '(mellitus) (sugar)'}"):
+            # Find the Diabetes term first in the D letter
+            for letter in icd10_data['letters']:
+                if letter['title'] == 'D':
+                    for term in letter['terms']:
+                        title = term.get('title', '')
+                        if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                            # Find the "with" child
+                            for child in term.get('children', []):
+                                if child.get('title', '') == 'with' and 'children' in child:
+                                    return child['children']
+        else:
+            # If no parent_path or not from Diabetes, still try to find the Diabetes term
+            for letter in icd10_data['letters']:
+                if letter['title'] == 'D':
+                    for term in letter['terms']:
+                        title = term.get('title', '')
+                        if isinstance(title, dict) and title.get('_') == 'Diabetes, diabetic':
+                            # Find the "with" child
+                            for child in term.get('children', []):
+                                if child.get('title', '') == 'with' and 'children' in child:
+                                    return child['children']
+
+    # Regular path handling
+    for child in children:
+        # Safely access child_path, fallback to title if path doesn't exist
+        child_title = child.get('title', '')
+        child_path = child.get('path', child_title)
+
+        # Handle both string and object paths
+        if isinstance(child_path, dict):
+            path_text = child_path.get('_', '')
+            path_nemod = child_path.get('nemod', '')
+            full_path = f"{path_text} {path_nemod}".strip()
+        else:
+            full_path = str(child_path) if child_path else ''
+
+        # Check for exact match
+        if full_path == path and 'children' in child:
+            # Return children with their original level values
+            return child['children']
+
+        # Check for match with [object Object] in path
+        # This handles cases where the path contains "[object Object] > with"
+        if "[object Object]" in path and ">" in path:
+            # Extract the last part of the path (after the last ">")
+            path_parts = path.split(">")
+            last_part = path_parts[-1].strip()
+
+            # Check if the child's title matches the last part of the path
+            child_title = child['title']
+            if ((isinstance(child_title, str) and child_title == last_part) or
+                (isinstance(child_title, dict) and child_title.get('_', '') == last_part)) and 'children' in child:
+                # If parent_path is provided, make sure this is the right term
+                if parent_path and parent_path != full_path.split(" > ")[0]:
+                    continue
+                # Return children with their original level values
+                return child['children']
+
+        # Recursively search in this child's children if any
+        if 'children' in child:
+            result = find_children_for_path(child['children'], path, parent_path)
+            if result:
+                return result
+
+    return None
+
+@app.get("/api/code/{code}")
+def get_code_details(code: str):
+    """Get detailed information for a specific ICD-10 code"""
+    try:
+        # Search through all letters and terms to find the code
+        for letter in icd10_data['letters']:
+            for term in letter['terms']:
+                # Check if this term has the code
+                if term.get('code') == code:
+                    return {
+                        'term': term,
+                        'has_children': 'children' in term or 'terms' in term
+                    }
+                
+                # Check in children recursively
+                if 'children' in term:
+                    found_term = find_code_in_children(term['children'], code)
+                    if found_term:
+                        return {
+                            'term': found_term,
+                            'has_children': 'children' in found_term or 'terms' in found_term
+                        }
+                
+                # Check in terms array if it exists
+                if 'terms' in term:
+                    found_term = find_code_in_children(term['terms'], code)
+                    if found_term:
+                        return {
+                            'term': found_term,
+                            'has_children': 'children' in found_term or 'terms' in found_term
+                        }
+        
+        # If we get here, the code wasn't found
+        return {"error": f"Code {code} not found"}
+    except Exception as e:
+        logger.error(f"Error in get_code_details: {e}")
+        return {"error": str(e)}
+
+def find_code_in_children(children, code):
+    """Recursively search for a code in children"""
+    for child in children:
+        # Check if this child has the code
+        if child.get('code') == code:
+            return child
+        
+        # Check in this child's children
+        if 'children' in child:
+            found = find_code_in_children(child['children'], code)
+            if found:
+                return found
+        
+        # Check in terms array if it exists
+        if 'terms' in child:
+            found = find_code_in_children(child['terms'], code)
+            if found:
+                return found
+    
+    return None
+
+@app.get("/api/children")
+def get_code_children(code: str):
+    """Get children/subterms for a specific ICD-10 code"""
+    try:
+        # First find the term with this code
+        term = None
+        for letter in icd10_data['letters']:
+            for t in letter['terms']:
+                if t.get('code') == code:
+                    term = t
+                    break
+                
+                # Check in children recursively
+                if not term and 'children' in t:
+                    term = find_code_in_children(t['children'], code)
+                    if term:
+                        break
+                
+                # Check in terms array if it exists
+                if not term and 'terms' in t:
+                    term = find_code_in_children(t['terms'], code)
+                    if term:
+                        break
+            
+            if term:
+                break
+        
+        if not term:
+            return {"error": f"Code {code} not found"}
+        
+        # Return children or terms if they exist
+        if 'children' in term and term['children']:
+            return term['children']
+        elif 'terms' in term and term['terms']:
+            return term['terms']
+        else:
+            return []
+    except Exception as e:
+        logger.error(f"Error in get_code_children: {e}")
+        return {"error": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("chatbot:app", host="0.0.0.0", port=8000, reload=True)
