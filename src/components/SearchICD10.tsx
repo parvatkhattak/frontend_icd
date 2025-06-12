@@ -89,7 +89,7 @@ const SearchICD10: React.FC = () => {
       setError(null);
       
       try {
-        const endpoint = `https://icd-search.onrender.com/api/v1/search/${encodeURIComponent(searchQuery)}`;
+        const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(searchQuery)}`;
         console.log('Searching with endpoint:', endpoint);
         
         // ACTUAL API CALL - This was missing!
@@ -164,22 +164,64 @@ const SearchICD10: React.FC = () => {
     setQuery('');
   };
 
-  // Handle term selection
   const handleTermSelect = async (code: string, description: string) => {
     if (!code) return;
     
     if (searchMode === 'codes') {
       await fetchCodeDetails(code);
     } else {
-      // Handle index mode term selection
-      const termData: SearchResult = {
-        code,
-        description,
-        terms: [] // Mock empty terms for now
-      };
-      setSelectedTerm(termData);
-      setActiveTerm(termData);
-      setBreadcrumbs([{code, description}]);
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+        const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(code)}`;
+        const response = await fetch(endpoint, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        console.log('API Response for term:', data); // DEBUG LINE
+        
+        // FIX: Use the same field mapping as your formatResults function
+        const rawTermData = Array.isArray(data) && data.length > 0 ? data[0] : null;
+        
+        const termData: SearchResult = rawTermData ? {
+          code: rawTermData.ICDCode || rawTermData.lookupCode || rawTermData.code || code,
+          description: rawTermData.CodeDescription || rawTermData.description || description,
+          // Include all the other fields your API returns
+          ICDCode: rawTermData.ICDCode,
+          CodeDescription: rawTermData.CodeDescription,
+          KeywordforthisCode: rawTermData.KeywordforthisCode,
+          Synonym: rawTermData.Synonym,
+          Specificity: rawTermData.Specificity,
+          isBillable: rawTermData.isBillable,
+          terms: rawTermData.terms || []
+        } : { code, description, terms: [] };
+        
+        console.log('Processed term data:', termData); // DEBUG LINE
+        
+        setSelectedTerm(termData);
+        setActiveTerm(termData);
+        setBreadcrumbs([{code: termData.code, description: termData.description}]);
+        
+      } catch (err) {
+        console.error('Error fetching term details:', err);
+        setError(`Failed to fetch term details: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        
+        const termData: SearchResult = { code, description, terms: [] };
+        setSelectedTerm(termData);
+        setActiveTerm(termData);
+        setBreadcrumbs([{code, description}]);
+      } finally {
+        setIsLoading(false);
+      }
     }
     
     setShowResults(false);
@@ -192,7 +234,7 @@ const SearchICD10: React.FC = () => {
     
     try {
       // Actual API call for code details
-      const endpoint = `https://icd-search.onrender.comapi/v1/search/${encodeURIComponent(code)}`;
+      const endpoint = `http://localhost:8000/api/v1/search/${encodeURIComponent(code)}`;
       const response = await fetch(endpoint, {
         method: 'GET',
         headers: {
@@ -491,10 +533,56 @@ const SearchICD10: React.FC = () => {
             )}
             
             <div className="p-4">
-              <div className="text-center py-8 text-gray-500 dark:text-gray-400">
-                <p>Term details would be displayed here</p>
-                <p className="text-sm mt-2">Connect to your API to see full functionality</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                <div>
+                  <div className="mb-4">
+                    <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1">Code</h3>
+                    <p className="text-base text-gray-900 dark:text-white">
+                      {activeTerm?.ICDCode || activeTerm?.code || selectedTerm.ICDCode || selectedTerm.code}
+                    </p>
+                  </div>
+                  <div className="mb-4">
+                    <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1">Description</h3>
+                    <p className="text-base text-gray-900 dark:text-white">
+                    {activeTerm?.CodeDescription || activeTerm?.description || selectedTerm.CodeDescription || selectedTerm.description}
+                  </p>
+                  </div>
+                </div>
+                <div>
+                  {/* Add more fields as needed based on your API response */}
+                {selectedTerm.KeywordforthisCode && (
+                  <div className="mb-4">
+                    <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1">Keyword</h3>
+                    <p className="text-base text-gray-900 dark:text-white">{selectedTerm.KeywordforthisCode}</p>
+                  </div>
+                )}
+                {selectedTerm.Synonym && (
+                  <div className="mb-4">
+                    <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1">Synonym</h3>
+                    <p className="text-base text-gray-900 dark:text-white">{selectedTerm.Synonym}</p>
+                  </div>
+                )}
+                </div>
               </div>
+              
+              {/* Show subterms if available */}
+              {selectedTerm.terms && selectedTerm.terms.length > 0 && (
+                <div className="mt-6">
+                  <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-3">Related Terms</h3>
+                  <div className="space-y-2">
+                    {selectedTerm.terms.map((subterm, index) => (
+                      <div 
+                        key={index}
+                        className="p-3 border border-gray-200 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                        onClick={() => handleSubtermSelect(subterm)}
+                      >
+                        <div className="font-medium text-gray-900 dark:text-white">{subterm.description}</div>
+                        <div className="text-sm text-gray-500 dark:text-gray-400">{subterm.code}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
