@@ -3,47 +3,20 @@ import { Message, ChatContextType } from '../types';
 import { fetchChatHistory, fetchChatMessages, saveChatMessage, deleteChat as deleteSupabaseChat } from '../utils/supabaseClient';
 import { useAuth } from './AuthContext';
 
-// Backend API URLs
-const API_BASE_URL = "https://chatbot-vl3b.onrender.com/api";
+// Backend API URL
+const API_URL = "https://chatbot-vl3b.onrender.com/api/chat";
 
 export const ChatContext = createContext<ChatContextType>({} as ChatContextType);
 
 export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
-  const [currentChatId, setCurrentChatId] = useState<string>('');
+  const [currentChatId, setCurrentChatId] = useState<string>(() => {
+    // Generate a new chat ID on initial load
+    return Date.now().toString();
+  });
   const [chatHistories, setChatHistories] = useState<Array<{id: string, title: string, timestamp: number}>>([]);
   const { user } = useAuth();
-
-  // Initialize a new chat on component mount
-  useEffect(() => {
-    const initializeNewChat = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/new-chat`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          setCurrentChatId(data.chat_id);
-        } else {
-          // Fallback to timestamp-based ID
-          setCurrentChatId(Date.now().toString());
-        }
-      } catch (error) {
-        console.error('Error creating new chat:', error);
-        // Fallback to timestamp-based ID
-        setCurrentChatId(Date.now().toString());
-      }
-    };
-
-    if (!currentChatId) {
-      initializeNewChat();
-    }
-  }, [currentChatId]);
 
   // Load chat histories from Supabase on component mount or when user changes
   useEffect(() => {
@@ -74,7 +47,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Send request to backend API
       setIsTyping(true);
       try {
-        const response = await fetch(`${API_BASE_URL}/chat`, {
+        const response = await fetch(API_URL, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -82,8 +55,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           body: JSON.stringify({ 
             question: content,
             chat_id: currentChatId,
-            user_id: user?.user_metadata.user_id || 'default_user',
-            is_new_chat: messages.length === 1 // First user message in this session
+            user_id: user?.user_metadata.user_id || 'guest'
           }),
         });
         
@@ -98,20 +70,23 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           content: data.answer,
           role: 'assistant',
           timestamp: Date.now() + 1,
-          // sources: data.sources || [],
-          structured_query: data.structured_query,
-          conversation_context: data.conversation_context,
+          sources: data.sources || [],
         };
         
         setMessages((prevMessages) => [...prevMessages, aiResponse]);
         
-        // The backend now handles saving to Supabase automatically
-        // Update chat histories after the conversation is saved
+        // Save conversation to Supabase if user is logged in
         if (user) {
-          setTimeout(async () => {
-            const histories = await fetchChatHistory(user.user_metadata.user_id);
-            setChatHistories(histories);
-          }, 500); // Small delay to ensure backend has saved
+          await saveChatMessage(
+            user.user_metadata.user_id,
+            currentChatId,
+            content,
+            data.answer
+          );
+          
+          // Update chat histories after saving
+          const histories = await fetchChatHistory(user.user_metadata.user_id);
+          setChatHistories(histories);
         }
       } catch (error) {
         console.error('Error fetching response:', error);
@@ -128,119 +103,47 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const startNewChat = async () => {
+  const startNewChat = () => {
     setMessages([]);
-    
-    try {
-      const response = await fetch(`${API_BASE_URL}/new-chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        setCurrentChatId(data.chat_id);
-      } else {
-        // Fallback to timestamp-based ID
-        setCurrentChatId(Date.now().toString());
-      }
-    } catch (error) {
-      console.error('Error creating new chat:', error);
-      // Fallback to timestamp-based ID
-      setCurrentChatId(Date.now().toString());
-    }
+    setCurrentChatId(Date.now().toString());
   };
   
   const loadChat = async (chatId: string) => {
     try {
       if (!user) return;
       
-      // Use the backend API to get chat history
-      const response = await fetch(`${API_BASE_URL}/chat-history/${chatId}?user_id=${user.user_metadata.user_id}`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
+      const chatMessages = await fetchChatMessages(chatId, user.user_metadata.user_id);
+      if (chatMessages.length > 0) {
+        // Convert Supabase records to Message format
+        const formattedMessages: Message[] = [];
         
-        if (data.history && data.history.length > 0) {
-          // Convert API response to Message format
-          const formattedMessages: Message[] = data.history.map((msg: any, index: number) => ({
-            id: `${chatId}-${index}`,
-            content: msg.content,
-            role: msg.role,
-            timestamp: Date.now() + index
-          }));
-          
-          setMessages(formattedMessages);
-          setCurrentChatId(chatId);
-        }
-      } else {
-        console.error('Failed to load chat history from API');
-        
-        // Fallback to direct Supabase call
-        const chatMessages = await fetchChatMessages(chatId, user.user_metadata.user_id);
-        if (chatMessages.length > 0) {
-          const formattedMessages: Message[] = [];
-          
-          chatMessages.forEach(record => {
-            formattedMessages.push({
-              id: `${record.id}-user`,
-              content: record.user_message,
-              role: 'user',
-              timestamp: new Date(record.created_at).getTime()
-            });
-            
-            formattedMessages.push({
-              id: `${record.id}-assistant`,
-              content: record.ai_message,
-              role: 'assistant',
-              timestamp: new Date(record.created_at).getTime() + 1
-            });
+        chatMessages.forEach(record => {
+          // Add user message
+          formattedMessages.push({
+            id: `${record.id}-user`,
+            content: record.user_message,
+            role: 'user',
+            timestamp: new Date(record.created_at).getTime()
           });
           
-          setMessages(formattedMessages);
-          setCurrentChatId(chatId);
-        }
+          // Add AI message
+          formattedMessages.push({
+            id: `${record.id}-assistant`,
+            content: record.ai_message,
+            role: 'assistant',
+            timestamp: new Date(record.created_at).getTime() + 1
+          });
+        });
+        
+        setMessages(formattedMessages);
+        setCurrentChatId(chatId);
       }
     } catch (error) {
       console.error('Error loading chat:', error);
-      
-      // Fallback to direct Supabase call
-      try {
-        const chatMessages = await fetchChatMessages(chatId, user.user_metadata.user_id);
-        if (chatMessages.length > 0) {
-          const formattedMessages: Message[] = [];
-          
-          chatMessages.forEach(record => {
-            formattedMessages.push({
-              id: `${record.id}-user`,
-              content: record.user_message,
-              role: 'user',
-              timestamp: new Date(record.created_at).getTime()
-            });
-            
-            formattedMessages.push({
-              id: `${record.id}-assistant`,
-              content: record.ai_message,
-              role: 'assistant',
-              timestamp: new Date(record.created_at).getTime() + 1
-            });
-          });
-          
-          setMessages(formattedMessages);
-          setCurrentChatId(chatId);
-        }
-      } catch (fallbackError) {
-        console.error('Fallback chat loading also failed:', fallbackError);
-      }
     }
   };
+
+
 
   // Delete a chat from Supabase and update local state
   const deleteChat = async (chatId: string) => {
@@ -258,7 +161,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         
         // If the deleted chat was the current one, start a new chat
         if (currentChatId === chatId) {
-          await startNewChat();
+          startNewChat();
         }
       }
     } catch (error) {
